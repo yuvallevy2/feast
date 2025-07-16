@@ -31,7 +31,14 @@ def repo_config(redis_config):
 
 @pytest.fixture
 def vector_feature_view():
-    entity = Entity(name="item", join_keys=["item_id"])
+    from feast import FileSource
+    from feast.value_type import ValueType
+
+    entity = Entity(name="item", join_keys=["item_id"], value_type=ValueType.INT64)
+    data_source = FileSource(
+        path="dummy_path.parquet",
+        timestamp_field="event_timestamp"
+    )
     return FeatureView(
         name="test_embeddings",
         entities=[entity],
@@ -44,7 +51,7 @@ def vector_feature_view():
             ),
             Field(name="item_id", dtype=Int64),
         ],
-        source=Mock(),
+        source=data_source,
     )
 
 
