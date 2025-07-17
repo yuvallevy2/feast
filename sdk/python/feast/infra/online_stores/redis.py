@@ -94,6 +94,9 @@ class RedisOnlineStoreConfig(FeastConfigBaseModel, VectorStoreConfig):
     """(Optional) whether to scan for deletion of features"""
 
     # Vector search specific configurations
+    vector_enabled: Optional[bool] = False
+    """Whether to enable vector search capabilities"""
+
     vector_index_type: Optional[str] = "FLAT"
     """Vector index type: FLAT or HNSW"""
 
@@ -164,7 +167,7 @@ class RedisOnlineStore(OnlineStore):
             "COSINE"
         )
 
-        # Build vector field schema
+        # Build vector field schema - must be string for Redis FT.SEARCH
         vector_field_name = f"vector_{vector_field_metadata.name}"
 
         if online_store_config.vector_index_type.upper() == "HNSW":
@@ -185,8 +188,8 @@ class RedisOnlineStore(OnlineStore):
 
         # Create the index
         try:
-            # Use a wildcard prefix to match all keys since _redis_key generates binary keys
-            # that don't follow the simple project: prefix pattern
+            # Note: Feast uses binary serialized keys that don't match string prefixes
+            # So we index all hashes and let Redis filter by schema fields
             cmd = [
                 "FT.CREATE", index_name,
                 "ON", "HASH",
@@ -445,7 +448,8 @@ class RedisOnlineStore(OnlineStore):
                 event_time_seconds = int(utils.make_tzaware(timestamp).timestamp())
 
                 # ignore if event_timestamp is before the event features that are currently in the feature store
-                if prev_event_time:
+                # NOTE: For vector data, we may want to allow overwrites for development/testing
+                if prev_event_time and not vector_field_metadata:
                     prev_ts = Timestamp()
                     prev_ts.ParseFromString(prev_event_time)
                     if prev_ts.seconds and event_time_seconds <= prev_ts.seconds:
@@ -470,6 +474,7 @@ class RedisOnlineStore(OnlineStore):
                         # Convert vector data to bytes for Redis vector search
                         vector_data = self._extract_vector_from_value(val)
                         if vector_data is not None:
+                            # Vector field names must be strings for Redis FT.SEARCH to work
                             vector_field_name = f"vector_{feature_name}"
                             entity_hset[vector_field_name] = vector_data
 
@@ -670,16 +675,16 @@ class RedisOnlineStore(OnlineStore):
         )
         redis_distance_metric = REDIS_DISTANCE_METRICS.get(search_distance_metric.upper(), "COSINE")
 
-        # Build the search query
+        # Build the search query - must be string for Redis FT.SEARCH
         vector_field_name = f"vector_{vector_field_metadata.name}"
 
         try:
-            # Perform vector search using FT.SEARCH
+            # Perform vector search using FT.SEARCH as per Redis documentation
             search_cmd = [
                 "FT.SEARCH", index_name,
-                f"*=>[KNN {top_k} @{vector_field_name} $BLOB AS vector_score]",
-                "PARAMS", "2", "BLOB", query_vector,
-                "SORTBY", "vector_score",
+                f"*=>[KNN {top_k} @{vector_field_name} $query_vec AS distance]",
+                "PARAMS", "2", "query_vec", query_vector,
+                "SORTBY", "distance",
                 "LIMIT", "0", str(top_k),
                 "DIALECT", "2"
             ]
@@ -698,14 +703,22 @@ class RedisOnlineStore(OnlineStore):
                         # Extract entity key from redis key
                         entity_key = self._extract_entity_key_from_redis_key(redis_key, config)
 
-                        # Convert field values to feature dict
-                        feature_dict = self._convert_search_result_to_features(
+                        # Convert field values to feature dict and extract distance
+                        feature_dict, distance = self._convert_search_result_to_features(
                             field_values, table, requested_features
                         )
+
+                        # Add distance to feature_dict as a special feature
+                        if distance is not None and feature_dict is not None:
+                            from feast.protos.feast.types.Value_pb2 import Value as ValueProto
+                            distance_value = ValueProto()
+                            distance_value.double_val = distance
+                            feature_dict["distance"] = distance_value
 
                         # Extract timestamp
                         timestamp = self._extract_timestamp_from_features(feature_dict, table.name)
 
+                        # Return standard 3-tuple format expected by Feast
                         results.append((timestamp, entity_key, feature_dict))
 
             return results
@@ -717,54 +730,27 @@ class RedisOnlineStore(OnlineStore):
     def _extract_entity_key_from_redis_key(self, redis_key: bytes, config: RepoConfig) -> Optional[EntityKeyProto]:
         """Extract entity key from Redis key."""
         try:
-            # The Redis key format is: serialized_entity_key + project_name
-            # We need to extract the entity key from the binary format
+            from feast.infra.key_encoding_utils import deserialize_entity_key
+
+            # Redis key format: serialized_entity_key + project_name
+            # Remove the project name from the end
             project_bytes = config.project.encode('utf-8')
             if redis_key.endswith(project_bytes):
-                # Remove the project suffix to get the serialized entity key
+                # Extract the serialized entity key part (everything except the project name)
                 serialized_entity_key = redis_key[:-len(project_bytes)]
 
-                # Try to deserialize the actual entity key
-                from feast.protos.feast.types.EntityKey_pb2 import EntityKey as EntityKeyProto
-                try:
-                    entity_key = EntityKeyProto()
-                    entity_key.ParseFromString(serialized_entity_key)
-                    return entity_key
-                except Exception:
-                    # Silently fall back to heuristic extraction without logging warnings
-                    pass
-
-                # Fallback: try to extract document_id from the binary data
-                # The key contains document_id as an int64 value
-                # Look for the document_id pattern in the binary data
-                import struct
-                try:
-                    # Try to find int64 values in the binary data
-                    # This is a heuristic approach to extract the document_id
-                    for i in range(0, len(serialized_entity_key) - 7, 1):
-                        try:
-                            # Try to unpack as little-endian int64
-                            doc_id = struct.unpack('<Q', serialized_entity_key[i:i+8])[0]
-                            # Check if it's a reasonable document ID (1-10)
-                            if 1 <= doc_id <= 10:
-                                from feast.protos.feast.types.Value_pb2 import Value as ValueProto
-                                entity_key = EntityKeyProto()
-                                entity_key.join_keys.append("document_id")
-                                value = ValueProto()
-                                value.int64_val = doc_id
-                                entity_key.entity_values.append(value)
-                                return entity_key
-                        except struct.error:
-                            continue
-                except Exception:
-                    # Silently handle extraction errors
-                    pass
-
-                # Final fallback: return None to indicate failure
+                # Deserialize the entity key
+                entity_key = deserialize_entity_key(
+                    serialized_entity_key,
+                    entity_key_serialization_version=config.entity_key_serialization_version
+                )
+                return entity_key
+            else:
+                logger.warning(f"Redis key does not end with expected project name: {redis_key}")
                 return None
-            return None
-        except Exception:
-            # Silently handle all errors to avoid cluttering logs
+
+        except Exception as e:
+            logger.warning(f"Failed to extract entity key from Redis key {redis_key}: {e}")
             return None
 
     def _convert_search_result_to_features(
@@ -772,16 +758,27 @@ class RedisOnlineStore(OnlineStore):
         field_values: List,
         table: FeatureView,
         requested_features: List[str]
-    ) -> Optional[Dict[str, ValueProto]]:
-        """Convert Redis search result field values to feature dictionary."""
+    ) -> Optional[Tuple[Dict[str, ValueProto], Optional[float]]]:
+        """Convert Redis search result field values to feature dictionary and extract distance."""
         try:
             # field_values is a list of [field_name, field_value, field_name, field_value, ...]
             field_dict = {}
+            distance = None
+
             for i in range(0, len(field_values), 2):
                 if i + 1 < len(field_values):
                     field_name = field_values[i]
                     field_value = field_values[i + 1]
-                    field_dict[field_name] = field_value
+
+                    # Extract distance field as per Redis documentation
+                    if field_name == 'distance' or field_name == b'distance':
+                        try:
+                            distance = float(field_value)
+                        except (ValueError, TypeError):
+                            logger.warning(f"Could not convert distance to float: {field_value}")
+                    else:
+                        # Keep field names as-is (binary or string) for proper matching
+                        field_dict[field_name] = field_value
 
             # Convert to ValueProto format
             feature_dict = {}
@@ -789,27 +786,21 @@ class RedisOnlineStore(OnlineStore):
                 # Look for the feature in the field dict using the hashed key
                 f_key = _mmh3(f"{table.name}:{feature_name}")
 
+                # Try both binary and string versions of the key
                 if f_key in field_dict:
                     val = ValueProto()
                     val.ParseFromString(field_dict[f_key])
                     feature_dict[feature_name] = val
+                elif str(f_key) in field_dict:
+                    val = ValueProto()
+                    val.ParseFromString(field_dict[str(f_key)])
+                    feature_dict[feature_name] = val
 
-            # Add vector_score as distance if available
-            if b'vector_score' in field_dict:
-                try:
-                    score_str = field_dict[b'vector_score'].decode('utf-8')
-                    score = float(score_str)
-                    distance_val = ValueProto()
-                    distance_val.double_val = score
-                    feature_dict['distance'] = distance_val
-                except (ValueError, UnicodeDecodeError) as e:
-                    logger.warning(f"Failed to convert vector_score to distance: {e}")
-
-            return feature_dict if feature_dict else None
+            return (feature_dict if feature_dict else None), distance
 
         except Exception as e:
             logger.error(f"Failed to convert search result to features: {e}")
-            return None
+            return None, None
 
     def _extract_timestamp_from_features(self, feature_dict: Optional[Dict[str, ValueProto]], table_name: str) -> Optional[datetime]:
         """Extract timestamp from feature dictionary."""
