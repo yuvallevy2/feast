@@ -167,7 +167,7 @@ class RedisOnlineStore(OnlineStore):
             "COSINE"
         )
 
-        # Build vector field schema
+        # Build vector field schema - must be string for Redis FT.SEARCH
         vector_field_name = f"vector_{vector_field_metadata.name}"
 
         if online_store_config.vector_index_type.upper() == "HNSW":
@@ -188,10 +188,11 @@ class RedisOnlineStore(OnlineStore):
 
         # Create the index
         try:
+            # Use no prefix - let Redis index all hash keys that have the vector field
             cmd = [
                 "FT.CREATE", index_name,
                 "ON", "HASH",
-                "PREFIX", "1", f"{config.project}:",
+                # Remove PREFIX entirely - index all hashes with the vector field
                 "SCHEMA",
                 vector_field_name, "VECTOR", online_store_config.vector_index_type.upper(),
                 str(len(vector_schema))
@@ -447,7 +448,8 @@ class RedisOnlineStore(OnlineStore):
                 event_time_seconds = int(utils.make_tzaware(timestamp).timestamp())
 
                 # ignore if event_timestamp is before the event features that are currently in the feature store
-                if prev_event_time:
+                # NOTE: For vector data, we may want to allow overwrites for development/testing
+                if prev_event_time and not vector_field_metadata:
                     prev_ts = Timestamp()
                     prev_ts.ParseFromString(prev_event_time)
                     if prev_ts.seconds and event_time_seconds <= prev_ts.seconds:
@@ -472,6 +474,7 @@ class RedisOnlineStore(OnlineStore):
                         # Convert vector data to bytes for Redis vector search
                         vector_data = self._extract_vector_from_value(val)
                         if vector_data is not None:
+                            # Vector field names must be strings for Redis FT.SEARCH to work
                             vector_field_name = f"vector_{feature_name}"
                             entity_hset[vector_field_name] = vector_data
 
@@ -672,7 +675,7 @@ class RedisOnlineStore(OnlineStore):
         )
         redis_distance_metric = REDIS_DISTANCE_METRICS.get(search_distance_metric.upper(), "COSINE")
 
-        # Build the search query
+        # Build the search query - must be string for Redis FT.SEARCH
         vector_field_name = f"vector_{vector_field_metadata.name}"
 
         try:
@@ -719,14 +722,25 @@ class RedisOnlineStore(OnlineStore):
     def _extract_entity_key_from_redis_key(self, redis_key: bytes, config: RepoConfig) -> Optional[EntityKeyProto]:
         """Extract entity key from Redis key."""
         try:
-            # Redis key format: project:entity_key_hash
-            key_str = redis_key.decode('utf-8')
-            project_prefix = f"{config.project}:"
-            if key_str.startswith(project_prefix):
-                # For now, return None as entity key extraction requires more complex logic
-                # This would need to be implemented based on the specific entity key serialization
+            from feast.infra.key_encoding_utils import deserialize_entity_key
+
+            # Redis key format: serialized_entity_key + project_name
+            # Remove the project name from the end
+            project_bytes = config.project.encode('utf-8')
+            if redis_key.endswith(project_bytes):
+                # Extract the serialized entity key part (everything except the project name)
+                serialized_entity_key = redis_key[:-len(project_bytes)]
+
+                # Deserialize the entity key
+                entity_key = deserialize_entity_key(
+                    serialized_entity_key,
+                    entity_key_serialization_version=config.entity_key_serialization_version
+                )
+                return entity_key
+            else:
+                logger.warning(f"Redis key does not end with expected project name: {redis_key}")
                 return None
-            return None
+
         except Exception as e:
             logger.warning(f"Failed to extract entity key from Redis key {redis_key}: {e}")
             return None
@@ -743,8 +757,9 @@ class RedisOnlineStore(OnlineStore):
             field_dict = {}
             for i in range(0, len(field_values), 2):
                 if i + 1 < len(field_values):
-                    field_name = field_values[i].decode('utf-8') if isinstance(field_values[i], bytes) else field_values[i]
+                    field_name = field_values[i]
                     field_value = field_values[i + 1]
+                    # Keep field names as-is (binary or string) for proper matching
                     field_dict[field_name] = field_value
 
             # Convert to ValueProto format
@@ -752,11 +767,15 @@ class RedisOnlineStore(OnlineStore):
             for feature_name in requested_features:
                 # Look for the feature in the field dict using the hashed key
                 f_key = _mmh3(f"{table.name}:{feature_name}")
-                f_key_str = f_key.decode('utf-8') if isinstance(f_key, bytes) else str(f_key)
 
-                if f_key_str in field_dict:
+                # Try both binary and string versions of the key
+                if f_key in field_dict:
                     val = ValueProto()
-                    val.ParseFromString(field_dict[f_key_str])
+                    val.ParseFromString(field_dict[f_key])
+                    feature_dict[feature_name] = val
+                elif str(f_key) in field_dict:
+                    val = ValueProto()
+                    val.ParseFromString(field_dict[str(f_key)])
                     feature_dict[feature_name] = val
 
             return feature_dict if feature_dict else None
