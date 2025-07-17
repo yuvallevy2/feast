@@ -6,7 +6,7 @@
 set -e
 
 # Configuration
-export REGISTRY="your-registry.com"  # Change this to your container registry
+export REGISTRY="yuvallevy543/feast"  # Change this to your container registry
 export VERSION="redis-vector-$(date +%Y%m%d-%H%M%S)"
 export FEAST_VERSION="redis-vector-dev"
 
